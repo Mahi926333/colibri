@@ -211,6 +211,13 @@ static volatile unsigned pilot_r = 0, pilot_w = 0;
 static Model *pilot_m = NULL;
 static int g_pilot = 0;
 static int g_wide  = 1;  /* IMPROVEMENT 4: top-K * g_wide candidates prefetched */
+/* PAR_LOAD=n (opt-in, default 0 = off): at decode, fetch a token's K routed
+ * experts with n threads before computing them, so cache misses read from disk
+ * in parallel instead of one at a time. The experts are still computed one by
+ * one in routing order, so the output is the same bits; only the fetch overlaps.
+ * Used only when a layer's cache holds at least 2*K slots, so the K slots a
+ * token keeps busy can never starve eviction. */
+static int g_par_load = 0;
 static int g_pilot_evict_guard = 1; /* PILOT_EVICT_GUARD=0 to disable LFRU prefetch eviction guard */
 static int g_expert_drop = 0;       /* EXPERT_DROP=1 restores fadvise(DONTNEED) after expert reads */
 #if defined(__AVX2__) || !defined(OLMOE_NO_MAIN)
@@ -1920,8 +1927,31 @@ static void moe_routed(Model *m, int layer, float *x, int S, float *logits, floa
         int idx[64]; float val[64];
         moe_route_row(m, layer, s, logits + (int64_t)s*E, idx, val);
         const float *xs = x + (int64_t)s*D;
+        Slot *pre[64];
+        int par = g_par_load > 1 && K <= 64 && m->cache[layer].cap >= 2 * K;
+        if (par) {
+            /* Go parallel only when two or more experts must come from disk: a
+             * token whose experts are all resident pays no thread start-up. */
+            int miss_k[64], nm = 0, is_miss[64];
+            pthread_mutex_lock(&g_pilot_mx);
+            for (int kk = 0; kk < K; kk++) {
+                is_miss[kk] = slot_indexed(m, layer, idx[kk]) == NULL;
+                if (is_miss[kk]) miss_k[nm++] = kk;
+            }
+            pthread_mutex_unlock(&g_pilot_mx);
+            if (nm >= 2) {
+                /* Take the resident ones first (no disk), so the loads below
+                 * cannot evict an expert this token is about to use. */
+                for (int kk = 0; kk < K; kk++)
+                    if (!is_miss[kk]) expert_get(m, layer, idx[kk], &pre[kk]);
+                int nt = nm < g_par_load ? nm : g_par_load;
+                #pragma omp parallel for num_threads(nt) schedule(dynamic, 1)
+                for (int j = 0; j < nm; j++) expert_get(m, layer, idx[miss_k[j]], &pre[miss_k[j]]);
+            } else par = 0;
+        }
         for (int kk = 0; kk < K; kk++) {
-            Slot *e; expert_get(m, layer, idx[kk], &e);
+            Slot *e;
+            if (par) e = pre[kk]; else expert_get(m, layer, idx[kk], &e);
             moe_expert_row(m, e, xs, g, u, hh);
             expert_put(e);
             float w = val[kk];
@@ -3346,6 +3376,9 @@ int main(int argc, char **argv) {
     if (!snap) { coli_print_launcher_help("OLMoE", "SNAP=<model directory> ./olmoe ..."); return 1; }
     g_pilot = getenv("PILOT") ? atoi(getenv("PILOT")) : 0;
     g_wide  = getenv("WIDE")  ? atoi(getenv("WIDE"))  : 1;
+    g_par_load = getenv("PAR_LOAD") ? atoi(getenv("PAR_LOAD")) : 0;
+    if (g_par_load < 0) g_par_load = 0;
+    if (g_par_load > 16) g_par_load = 16;
     g_pilot_evict_guard = getenv("PILOT_EVICT_GUARD") ? atoi(getenv("PILOT_EVICT_GUARD")) : 1;
     g_expert_drop = getenv("EXPERT_DROP") ? atoi(getenv("EXPERT_DROP")) : 0;
     g_fused3     = getenv("FUSED3") ? atoi(getenv("FUSED3")) : 0;
@@ -3503,6 +3536,9 @@ int main(int argc, char **argv) {
     }
 
     int *out = malloc((np + n_new) * sizeof(int));
+    /* TIME line: where the run's wall time went (measurement only). */
+    uint64_t prof_disk0 = __atomic_load_n(&m.disk_ns, __ATOMIC_RELAXED);
+    double prof_attn0 = g_prof_attn_s, prof_moe0 = g_prof_moe_s, prof_head0 = g_prof_head_s;
     double t = now_s();
     generate(&m, prompt, np, n_new, out);
     double dt = now_s() - t;
@@ -3538,6 +3574,14 @@ int main(int argc, char **argv) {
     { const char *up = getenv("COLI_USAGE");
       if (up && *up) rt_save(up, 0); }              /* same bytes as every other engine */
     printf("Speed: %.2f tok/s (%.1fs for %d tokens)\n", n_new/dt, dt, n_new);
+    {
+        double disk_s = (double)(__atomic_load_n(&m.disk_ns, __ATOMIC_RELAXED) - prof_disk0) / 1e9;
+        double attn_s = g_prof_attn_s - prof_attn0, moe_s = g_prof_moe_s - prof_moe0;
+        double head_s = g_prof_head_s - prof_head0;
+        printf("TIME: total %.2fs | attention %.2fs | experts %.2fs | disk reads %.2fs%s | head %.2fs | other %.2fs\n",
+               dt, attn_s, moe_s, disk_s, g_pilot ? " (incl. background prefetch)" : "",
+               head_s, dt - attn_s - moe_s - head_s);
+    }
     /* One line, every engine, one format: `coli tune` sweeps scheduling knobs and
      * needs tokens-and-elapsed to compare candidates. Before this only colibri
      * emitted a parseable throughput line (REPLAY decode), so the tuner was
